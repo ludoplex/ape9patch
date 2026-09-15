@@ -1,175 +1,112 @@
-# E9Patch - A Powerful Static Binary Rewriter
+# ape9patch
 
-E9Patch is a powerful static binary rewriting tool for `x86_64` Linux ELF
-binaries.
-E9Patch is:
+**APE (Actually Portable Executable) binary rewriting and live delta patching.**
 
-* *Scalable*: E9Patch can reliably rewrite large/complex binaries
-  including web browsers (>100MB in size).
-* *Compatible*: The rewritten binary is a drop-in replacement of the
-  original, with no additional dependencies.
-* *Fast*: E9Patch can rewrite most binaries in a few seconds.
-* *Low Overheads*: Both performance and memory.
-* *Programmable*: E9Patch is designed so that it can be easily integrated
-  into other projects.
-  See the [E9Tool User's Guide](https://github.com/GJDuck/e9patch/blob/master/doc/e9tool-user-guide.md) and the [E9Patch Programmer's Guide](https://github.com/GJDuck/e9patch/blob/master/doc/e9patch-programming-guide.md)
-  for more information.
+`ape9patch` extends [e9patch](https://github.com/GJDuck/e9patch) — Gregory J. Duck's static
+binary rewriter — from `x86_64` Linux **ELF** binaries to
+[Cosmopolitan](https://github.com/jart/cosmopolitan) **APE polyglot** binaries, across
+AMD64 and AArch64.
 
-*Static binary rewriting* takes an input binary 
-(ELF executable or shared object) and generates an output binary
-with some patch/modification applied to it.
-The patched binary can be used as a drop-in replacement of the original.
+Upstream e9patch is ELF-only. An APE binary is a single file that is simultaneously a DOS MZ
+executable, a shell script, a PE executable and an ELF — and, critically, **it carries no
+embedded `x86_64` ELF header at all**. The ELF-header and program-header paths that upstream
+relies on have nothing to read. `ape9patch` is the layer that makes APE a rewritable target.
 
-For more information, please see our PLDI'2020 paper:
+## Why APE needs its own layer
 
-* Gregory J. Duck, Xiang Gao, Abhik Roychoudhury, [Binary Rewriting without Control Flow Recovery](https://comp.nus.edu.sg/~gregory/papers/e9patch.pdf),
-  Programming Language Design and Implementation (PLDI), 2020.
-  [PLDI'2020 Presentation](https://www.youtube.com/watch?v=qK2ZCEStoG0)
+Structure recovered by reverse-engineering real `cosmocc` output
+(see [`doc/ape-anatomy-analysis.md`](doc/ape-anatomy-analysis.md)):
 
-## Release
+```
+0x00000   MZ header "MZqFpD" + shell-script bootstrap
+0x10A58   PE header (e_lfanew points here)
+0x11000   .text     <- file offset == RVA in APE
+0x2F000   .rdata
+0x35000   .data
+0x3C000   ARM64 ELF  (aarch64 only - NOT x86-64)
+EOF-256   ZipOS (.cosmo, .symtab.amd64, .symtab.arm64)
+```
 
-Pre-built E9Patch binaries can be downloaded here:
+Consequences that drive the design:
 
-* [https://github.com/GJDuck/e9patch/releases](https://github.com/GJDuck/e9patch/releases)
+- **No `x86_64` ELF header.** PE sections are used as ground truth for address translation.
+- **`file_offset` frequently equals RVA**, but not always — the mapping is computed per
+  section rather than assumed.
+- **The ARM64 ELF at `0x3C000` is a separate image view.** Patching an x86-64 offset must not
+  disturb it, and vice versa.
+- **ZipOS occupies the tail of the file**, holding `.cosmo` and the per-architecture symbol
+  tables.
+
+## What ships today
+
+| Capability | Entry point |
+|---|---|
+| APE detection | `e9_ape_detect()` |
+| APE parsing into image views | `e9_ape_parse()` -> `E9_APEInfo` |
+| Address translation | `e9_ape_rva_to_offset()` / `e9_ape_offset_to_rva()` |
+| In-place delta patching | `e9_ape_patch_offset()` / `e9_ape_patch_rva()` / `e9_ape_patch()` |
+| ZipOS entry enumeration | `e9_ape_zipos_exists()` / `e9_ape_zipos_free_list()` |
+| Live reload / hot patching | `src/e9patch/e9livereload.c` |
+| Cross-platform process memory | `src/e9patch/e9procmem.c` |
+| Info dump | `e9_ape_dump_info()` |
+
+Live reload watches the target with `stat` polling — portable across the platforms an APE
+runs on, rather than depending on a Linux-specific notify API — and applies patches to the
+mapped image.
+
+### Status — scope of the patching primitive
+
+Patching is **same-size, in-place replacement** at a computed file offset: new bytes must be
+the same length as the bytes they replace. This is what the live-reload path is built on
+(`e9livereload.c` treats Binaryen-produced patches as same-size replacements).
+
+Trampoline-based *insertion* — upstream's `e9trampoline` machinery, which is what gives
+e9patch its ELF instrumentation power — is **not wired into the APE path**. Same-size
+overwrites are safe across the disjoint MZ / PE / ELF / ZipOS regions by construction;
+trampoline-grade insertion on APE would additionally have to preserve coherence between the
+image views, and that is not implemented here. The ELF and APE feature sets are not
+equivalent.
+
+## Layout
+
+First-party APE work (no counterpart upstream):
+
+```
+src/e9patch/e9ape.c          e9ape.h          APE detect / parse / address map / patch
+src/e9patch/e9livereload.c   e9livereload.h   live reload + hot patching
+src/e9patch/e9procmem.c      e9procmem.h      unified cross-platform process memory
+doc/ape-anatomy-analysis.md                   RE analysis of APE structure
+specs/e9ape.schema  e9ape.sm                  APE model + state machine
+specs/e9livereload.schema                     live-reload model
+specs/behavior/livereload.sm                  live-reload state machine
+specs/features/ape_detection.feature
+specs/features/ape_patching.feature
+specs/features/e9livereload.feature
+test/livereload/                              test harness
+```
+
+Everything else is upstream e9patch, retained with its history intact. Upstream's own README
+is preserved as [`README.e9patch.md`](README.e9patch.md).
 
 ## Build
 
-Building E9Patch is very easy: simply run the `build.sh` script.
+```sh
+make -f Makefile.e9studio          # builds the APE layer (e9ape.c, e9livereload.c)
+make -f Makefile.cosmo studio      # builds e9studio.com - the tool itself as an APE
+cd test/livereload && make         # live-reload test harness
+```
 
-This will automatically build two tools:
+## Related
 
-1. `e9patch`: the binary rewriter backend; and
-2. `e9tool`: a linear disassembly frontend for E9Patch.
-
-## Example Usage
-
-E9Patch is usable via the E9Tool frontend.
-
-For example, to add instruction printing instrumentation to all `xor`
-instructions in `xterm`, we can use the following command:
-
-        $ ./e9tool -M 'asm=/xor.*/' -P print xterm
-
-This will generate a modified version of `xterm` written to the `a.out` file.
-
-The modified `xterm` can be run as normal, but will print the assembly
-string of each executed `xor` instruction to `stderr`:
-
-        $ ./a.out
-        xorl %ebp, %ebp
-        xorl %ebx, %ebx
-        xorl %eax, %eax
-        xorl %edx, %edx
-        xorl %edi, %edi
-        ...
-
-For a full list of supported options and modes, see:
-
-        $ ./e9tool --help
-
-### More Examples
-
-Patch all jump instructions with "empty" instrumentation:
-
-        $ ./e9tool -M 'asm=/j.*/' -P empty xterm
-        $ ./a.out
-
-Print all jump instructions with "print" instrumentation:
-
-        $ ./e9tool -M 'asm=/j.*/' -P print xterm
-        $ ./a.out
-
-Same as above, but use "Intel" syntax:
-
-        $ ./e9tool -M 'asm=/j.*/' -P print xterm --syntax=intel
-        $ ./a.out
-
-Patch all jump instructions with a call to an empty function:
-
-        $ ./e9compile.sh examples/nop.c
-        $ ./e9tool -M 'asm=/j.*/' -P 'entry()@nop' xterm
-        $ ./a.out
-
-Patch all jump instructions with instruction count instrumentation:
-
-        $ ./e9compile.sh examples/counter.c
-        $ ./e9tool -M 'asm=/j.*/' -P 'entry()@counter' xterm
-        $ FREQ=10000 ./a.out
-
-Patch all jump instructions with pretty print instrumentation:
-
-        $ ./e9compile.sh examples/print.c
-        $ ./e9tool -M 'asm=/j.*/' -P 'entry(addr,instr,size,asm)@print' xterm
-        $ ./a.out
-
-Patch all jump instructions with "delay" instrumentation to slow the
-program down:
-
-        $ ./e9compile.sh examples/delay.c
-        $ ./e9tool -M 'asm=/j.*/' -P 'entry()@delay' xterm
-        $ DELAY=100000 ./a.out
-
-*Notes*:
-
-* Tested for `XTerm(322)`
-
-## Projects
-
-Some other projects that use E9Patch include:
-
-* [RedFat](https://github.com/GJDuck/RedFat): A binary hardening system based
-  on [low-fat pointers](https://github.com/GJDuck/LowFat).
-* [E9AFL](https://github.com/GJDuck/e9afl): Automatically insert
-  [AFL](https://github.com/google/AFL) instrumentation into binaries.
-* [E9Syscall](https://github.com/GJDuck/e9syscall): System call
-  interception using static binary rewriting of `libc.so`.
-* [Hopper](https://github.com/FuzzAnything/hopper): Automatic fuzzing test
-  cases generation for libraries.
-* [EnvFuzz](https://github.com/GJDuck/EnvFuzz): Program environment fuzzing.
-* [RFF](https://github.com/dylanjwolff/RFF): Greybox fuzzing for
-  concurrency testing.
-* [AutoTrace](https://github.com/GJDuck/AutoTrace): Simple source line-based
-  tracing.
-
-## Documentation
-
-E9Patch is a low-level tool that is designed to be integrable into other
-projects.
-To find out more, please see the following documentation:
-
-* [E9Patch Programmer's Guide](https://github.com/GJDuck/e9patch/blob/master/doc/e9patch-programming-guide.md)
-* [E9Tool User's Guide](https://github.com/GJDuck/e9patch/blob/master/doc/e9tool-user-guide.md)
-
-## Bugs
-
-Bugs can be reported here:
-
-* [https://github.com/GJDuck/e9patch/issues](https://github.com/GJDuck/e9patch/issues)
-
-## Versions
-
-The current version of E9Patch is significantly improved compared to
-the original prototype evaluated in the PLDI'2020 paper.
-Specifically:
-
-* The current version implements several new optimizations and can generate
-  significantly faster binaries, sometimes by a factor of 2x.
-  To enable the new optimizations, pass the `-O2` option to E9Tool.
-* The implementation of the *Physical Page Grouping* space optimization
-  has also been improved.
-* The patching coverage has also been slightly improved.
-* Many new features have been implemented (see the documentation).
+- [`cosmo-bde`](https://github.com/ludoplex/cosmo-bde) — the spec-driven C generation
+  framework these specs are dogfooded against.
+- [`e9studio`](https://github.com/ludoplex/e9studio) — IDE front-end: compile and edit C
+  source with the resulting binary updated dynamically, DWARF symbol mapping, auto-CFG.
 
 ## License
 
-This software has been released under the GNU Public License (GPL) Version 3.
+**GPLv3+**, inherited from upstream e9patch.
 
-Some specific files are released under the MIT license (check the file
-preamble).
-
-## Acknowledgements
-
-This work was partially supported by the National Satellite of Excellence in
-Trustworthy Software Systems, funded by National Research Foundation (NRF)
-Singapore under the National Cybersecurity R&D (NCR) programme.
-
+Upstream e9patch is copyright © Gregory J. Duck and licensed GPLv3. This repository is a
+derivative work: upstream commit history and copyright notices are preserved, and the APE
+layer added here is released under the same terms. See [`LICENSE`](LICENSE).
