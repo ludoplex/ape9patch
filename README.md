@@ -50,9 +50,13 @@ Consequences that drive the design:
 | Cross-platform process memory | `src/e9patch/e9procmem.c` |
 | Info dump | `e9_ape_dump_info()` |
 
-Live reload watches the target with `stat` polling — portable across the platforms an APE
-runs on, rather than depending on a Linux-specific notify API — and applies patches to the
-mapped image.
+Live reload watches the source directory with `stat` polling — portable across the
+platforms an APE runs on, rather than depending on a Linux-specific notify API — recompiles
+through `posix_spawnp` (no shell), and applies patches to the mapped image.
+
+Process memory access picks its backend when the binary starts: `/proc/PID/mem` on Linux,
+NT process handles (`OpenProcess` / `NtReadVirtualMemory` / `WriteProcessMemory`, via the
+toolchain's `libc/nt` headers) on Windows; macOS and the BSDs support self-patching only.
 
 ### Status — scope of the patching primitive
 
@@ -90,11 +94,25 @@ is preserved as [`README.e9patch.md`](README.e9patch.md).
 
 ## Build
 
+The tool is built with the `cosmocc` toolchain, which is what lets one output
+file run on Linux, macOS, Windows and the BSDs (x86-64 and AArch64). The
+version and its sha256 are pinned in [`tool/cosmocc.mk`](tool/cosmocc.mk).
+
 ```sh
-make -f Makefile.e9studio          # builds the APE layer (e9ape.c, e9livereload.c)
-make -f Makefile.cosmo studio      # builds e9studio.com - the tool itself as an APE
-cd test/livereload && make         # live-reload test harness
+make -f Makefile.e9studio toolchain   # once: fetch cosmocc 4.0.2, verify sha256
+make -f Makefile.e9studio             # build/e9studio.com (APE layer + tool)
+make -f Makefile.e9studio check       # unit tests, --self-test, vendor tests
+make -f Makefile.e9studio COSMOCC=/path/to/cosmocc-4.0.2   # reuse an unpacked toolchain
 ```
+
+`Makefile.cosmo` remains as a compatibility entry point and forwards to the
+same build. Upstream's `e9patch`/`e9tool` are still built natively with `make`
+(see [`README.e9patch.md`](README.e9patch.md)). Details:
+[`doc/cosmopolitan-port.md`](doc/cosmopolitan-port.md).
+
+Every named function is indexed in [`FUNCTION_MANIFEST.md`](FUNCTION_MANIFEST.md)
+and a `FUNCTION_SUBMANIFEST.md` per directory; they are regenerated with each
+change and checked by a drift gate.
 
 ## Related
 
